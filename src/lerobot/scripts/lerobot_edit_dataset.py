@@ -282,6 +282,19 @@ Rename a camera feature from wrist to hand:
         --operation.type rename_cameras \
         --operation.renames '{"wrist": "hand"}'
 
+Change the dataset robot type:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --operation.type change_robot_type \
+        --operation.robot_type so_follower
+
+Change follower and leader robot types in a dataset that stores both fields:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --operation.type change_robot_type \
+        --operation.follower_robot_type so_follower \
+        --operation.leader_robot_type so_leader
+
 Using JSON config file:
     lerobot-edit-dataset \
         --config_path path/to/edit_config.json
@@ -340,6 +353,14 @@ class DeleteEpisodesConfig(OperationConfig):
 @dataclass
 class RenameCamerasConfig(OperationConfig):
     renames: dict[str, str] | None = None
+
+
+@OperationConfig.register_subclass("change_robot_type")
+@dataclass
+class ChangeRobotTypeConfig(OperationConfig):
+    robot_type: str | None = None
+    follower_robot_type: str | None = None
+    leader_robot_type: str | None = None
 
 
 @OperationConfig.register_subclass("resize_videos")
@@ -465,6 +486,26 @@ def _is_in_place(input_path: Path, output_path: Path) -> bool:
         return False
 
 
+def _backup_dataset_if_requested(dataset_root: Path) -> None:
+    backup_archive = dataset_root.with_name(dataset_root.name + "_old.zip")
+    if backup_archive.exists():
+        logging.warning(f"Using existing original dataset backup: {backup_archive}")
+        return
+
+    try:
+        response = input(f"Create backup archive {backup_archive}? [Y/n] ").strip().lower()
+    except EOFError:
+        response = ""
+        logging.warning("No interactive input available; creating the backup by default")
+
+    if response in {"n", "no"}:
+        logging.warning("Skipping original dataset backup")
+        return
+
+    logging.info(f"Backing up original dataset to {backup_archive}")
+    shutil.make_archive(str(backup_archive.with_suffix("")), "zip", root_dir=dataset_root)
+
+
 def get_output_path(
     repo_id: str,
     new_repo_id: str | None,
@@ -552,6 +593,104 @@ def handle_split(cfg: EditDatasetConfig) -> None:
             LeRobotDataset(split_ds.repo_id, root=split_ds.root).push_to_hub()
 
 
+def _merge_compatibility_issues(datasets: list[LeRobotDataset]) -> list[str]:
+    reference = datasets[0].meta
+    issues: list[str] = []
+
+    for index, dataset in enumerate(datasets[1:], start=1):
+        meta = dataset.meta
+        label = dataset.repo_id
+
+        if meta.robot_type != reference.robot_type:
+            issues.append(
+                f"robot_type differs: dataset 0={reference.robot_type!r}, {label}={meta.robot_type!r}"
+            )
+        if meta.fps != reference.fps:
+            issues.append(f"fps differs: dataset 0={reference.fps}, {label}={meta.fps}")
+
+        reference_keys = set(reference.features)
+        dataset_keys = set(meta.features)
+        if reference_keys != dataset_keys:
+            issues.append(
+                f"feature keys differ: dataset 0={sorted(reference_keys)}, "
+                f"{label}={sorted(dataset_keys)}"
+            )
+        for feature_key in sorted(reference_keys & dataset_keys):
+            reference_feature = reference.features[feature_key]
+            dataset_feature = meta.features[feature_key]
+            reference_structure = {
+                key: reference_feature.get(key)
+                for key in ("dtype", "shape", "names")
+            }
+            dataset_structure = {
+                key: dataset_feature.get(key)
+                for key in ("dtype", "shape", "names")
+            }
+            if reference_structure != dataset_structure:
+                issues.append(
+                    f"feature {feature_key!r} differs: dataset 0={reference_structure}, "
+                    f"{label}={dataset_structure}"
+                )
+
+            if reference_feature.get("dtype") == "video":
+                reference_info = reference_feature.get("info") or {}
+                dataset_info = dataset_feature.get("info") or {}
+                for info_key in ("video.codec", "video.width", "video.height", "video.fps"):
+                    if reference_info.get(info_key) != dataset_info.get(info_key):
+                        issues.append(
+                            f"feature {feature_key!r} {info_key} differs: "
+                            f"dataset 0={reference_info.get(info_key)!r}, "
+                            f"{label}={dataset_info.get(info_key)!r}"
+                        )
+
+        for metadata_key in ("storage_format", "data_path", "video_path"):
+            if getattr(meta, metadata_key) != getattr(reference, metadata_key):
+                issues.append(
+                    f"{metadata_key} differs: dataset 0={getattr(reference, metadata_key)!r}, "
+                    f"{label}={getattr(meta, metadata_key)!r}"
+                )
+
+    return issues
+
+
+def _validate_merge_compatibility(datasets: list[LeRobotDataset]) -> None:
+    logging.info("Checking merge compatibility for %d datasets", len(datasets))
+    issues = _merge_compatibility_issues(datasets)
+    categories = {
+        "robot_type": any(issue.startswith("robot_type ") for issue in issues),
+        "fps": any(issue.startswith("fps ") for issue in issues),
+        "feature structure": any(
+            issue.startswith("feature keys ")
+            or (issue.startswith("feature ") and not any(
+                f" {key} differs:" in issue
+                for key in ("video.codec", "video.width", "video.height", "video.fps")
+            ))
+            for issue in issues
+        ),
+        "video codec/resolution/fps": any(
+            any(
+                f" {key} differs:" in issue
+                for key in ("video.codec", "video.width", "video.height", "video.fps")
+            )
+            for issue in issues
+        ),
+        "storage metadata": any(
+            issue.startswith(("storage_format ", "data_path ", "video_path ")) for issue in issues
+        ),
+    }
+    for check, failed in categories.items():
+        log = logging.error if failed else logging.info
+        log("Merge compatibility: %s: %s", check, "FAILED" if failed else "OK")
+
+    if issues:
+        logging.error("Merge compatibility check failed with %d difference(s):", len(issues))
+        for issue in issues:
+            logging.error("  - %s", issue)
+        raise ValueError(
+            "Datasets are not compatible for merge. Resolve the differences reported above "
+            "before merging."
+        )
+
 def handle_merge(cfg: EditDatasetConfig) -> None:
     if not isinstance(cfg.operation, MergeConfig):
         raise ValueError("Operation config must be MergeConfig")
@@ -575,6 +714,8 @@ def handle_merge(cfg: EditDatasetConfig) -> None:
     else:
         logging.info(f"Loading {len(cfg.operation.repo_ids)} datasets to merge")
         datasets = [LeRobotDataset(repo_id) for repo_id in cfg.operation.repo_ids]
+
+    _validate_merge_compatibility(datasets)
 
     output_dir = Path(cfg.new_root) if cfg.new_root else HF_LEROBOT_HOME / cfg.new_repo_id
 
@@ -948,12 +1089,7 @@ def handle_rename_cameras(cfg: EditDatasetConfig) -> None:
         output_root = input_root
         if not input_root.is_dir():
             raise FileNotFoundError(f"Dataset directory does not exist: {input_root}")
-        backup_archive = input_root.with_name(input_root.name + "_old.zip")
-        if backup_archive.exists():
-            logging.warning(f"Using existing original dataset backup: {backup_archive}")
-        else:
-            logging.info(f"Backing up original dataset to {backup_archive}")
-            shutil.make_archive(str(backup_archive.with_suffix("")), "zip", root_dir=input_root)
+        _backup_dataset_if_requested(input_root)
     else:
         output_repo_id, input_root, output_root = _resolve_io_paths(
             cfg.repo_id,
@@ -971,6 +1107,64 @@ def handle_rename_cameras(cfg: EditDatasetConfig) -> None:
 
     _rename_camera_metadata(output_root, cfg.operation.renames)
     logging.info(f"Camera names renamed in {output_root}")
+
+    if cfg.push_to_hub:
+        dataset = LeRobotDataset(output_repo_id, root=output_root)
+        dataset.push_to_hub()
+
+
+def handle_change_robot_type(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, ChangeRobotTypeConfig):
+        raise ValueError("Operation config must be ChangeRobotTypeConfig")
+    requested = {
+        "robot_type": cfg.operation.robot_type,
+        "follower_robot_type": cfg.operation.follower_robot_type,
+        "leader_robot_type": cfg.operation.leader_robot_type,
+    }
+    requested = {key: value for key, value in requested.items() if value is not None}
+    if not requested:
+        raise ValueError(
+            "Specify at least one of robot_type, follower_robot_type, or leader_robot_type"
+        )
+
+    input_root = (Path(cfg.root) if cfg.root else HF_LEROBOT_HOME / cfg.repo_id).resolve()
+    change_in_place = cfg.new_repo_id is None and cfg.new_root is None
+    if change_in_place:
+        output_repo_id = cfg.repo_id
+        output_root = input_root
+        if not input_root.is_dir():
+            raise FileNotFoundError(f"Dataset directory does not exist: {input_root}")
+        _backup_dataset_if_requested(input_root)
+    else:
+        output_repo_id, input_root, output_root = _resolve_io_paths(
+            cfg.repo_id,
+            cfg.new_repo_id,
+            cfg.root,
+            cfg.new_root,
+            default_new_repo_id=f"{cfg.repo_id}_robot_type_changed",
+        )
+        if output_root.exists():
+            backup_path = output_root.with_name(output_root.name + "_old")
+            if backup_path.exists():
+                shutil.rmtree(backup_path)
+            shutil.move(output_root, backup_path)
+        shutil.copytree(input_root, output_root)
+
+    info_path = output_root / "meta" / "info.json"
+    if not info_path.is_file():
+        raise FileNotFoundError(f"Dataset metadata file does not exist: {info_path}")
+    info = json.loads(info_path.read_text())
+    for key, value in requested.items():
+        if key not in info:
+            logging.warning("Dataset metadata has no %r field; no value was changed", key)
+            continue
+        old_value = info[key]
+        info[key] = value
+        logging.info("Changed %s from %r to %r", key, old_value, value)
+
+    temp_info_path = info_path.with_suffix(".json.tmp")
+    temp_info_path.write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n")
+    os.replace(temp_info_path, info_path)
 
     if cfg.push_to_hub:
         dataset = LeRobotDataset(output_repo_id, root=output_root)
@@ -1012,16 +1206,7 @@ def handle_resize_videos(cfg: EditDatasetConfig) -> None:
         if not input_root.is_dir():
             raise FileNotFoundError(f"Dataset directory does not exist: {input_root}")
 
-        backup_archive = input_root.with_name(input_root.name + "_old.zip")
-        if backup_archive.exists():
-            logging.warning(f"Using existing original dataset backup: {backup_archive}")
-        else:
-            logging.info(f"Backing up original dataset to {backup_archive}")
-            shutil.make_archive(
-                str(backup_archive.with_suffix("")),
-                "zip",
-                root_dir=input_root,
-            )
+        _backup_dataset_if_requested(input_root)
         logging.warning(f"Resizing videos in-place at {input_root}")
     elif in_place:
         logging.warning(
@@ -1208,6 +1393,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_reencode_videos(cfg)
     elif operation_type == "rename_cameras":
         handle_rename_cameras(cfg)
+    elif operation_type == "change_robot_type":
+        handle_change_robot_type(cfg)
     elif operation_type == "resize_videos":
         handle_resize_videos(cfg)
     elif operation_type == "info":
