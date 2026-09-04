@@ -226,6 +226,13 @@ Re-encode videos in-place (overwrites original dataset):
         --operation.rgb_encoder.vcodec h264 \
         --operation.overwrite true
 
+Re-encode RGB videos using CUDA and NVIDIA NVENC:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --operation.type reencode_videos \
+        --operation.rgb_encoder.vcodec h264 \
+        --operation.use_gpu true
+
 Re-encode both RGB and depth videos in a dataset (depth quantization params are preserved):
     lerobot-edit-dataset \
         --repo_id lerobot/pusht \
@@ -332,6 +339,7 @@ from lerobot.datasets import (
     remove_feature,
     split_dataset,
 )
+from lerobot.datasets.io_utils import write_info
 from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.utils.utils import init_logging
 
@@ -433,6 +441,7 @@ class ReencodeVideosConfig(OperationConfig):
     num_workers: int = 0
     encoder_threads: int | None = None
     overwrite: bool = False
+    use_gpu: bool = False
 
 
 @OperationConfig.register_subclass("info")
@@ -504,6 +513,80 @@ def _backup_dataset_if_requested(dataset_root: Path) -> None:
 
     logging.info(f"Backing up original dataset to {backup_archive}")
     shutil.make_archive(str(backup_archive.with_suffix("")), "zip", root_dir=dataset_root)
+
+
+def _choose_reencode_output() -> int:
+    try:
+        response = input(
+            "Choose re-encode output: [1] create a new *_h264 dataset, "
+            "[2] overwrite the source dataset (default: 2): "
+        ).strip()
+    except EOFError:
+        response = ""
+        logging.warning("No interactive input available; choosing in-place re-encode by default")
+
+    if response in {"", "2"}:
+        return 2
+    if response == "1":
+        return 1
+    raise ValueError("Invalid choice. Enter 1 for a new dataset or 2 to overwrite the source dataset.")
+
+
+def _reencode_videos_with_gpu(
+    dataset: LeRobotDataset,
+    rgb_encoder: RGBEncoderConfig,
+    encoder_threads: int | None,
+) -> None:
+    if dataset.meta.depth_keys:
+        raise ValueError(
+            "GPU re-encoding does not support depth videos. Re-encode depth videos without "
+            "--operation.use_gpu."
+        )
+
+    codec_map = {"h264": "h264_nvenc", "hevc": "hevc_nvenc", "av1": "av1_nvenc"}
+    encoder = codec_map.get(rgb_encoder.vcodec, rgb_encoder.vcodec)
+    if not encoder.endswith("_nvenc"):
+        raise ValueError(
+            f"GPU re-encoding requires an NVIDIA-compatible codec (h264, hevc, or av1), got {rgb_encoder.vcodec!r}"
+        )
+
+    video_files = sorted((dataset.root / "videos").rglob("*.mp4"))
+    if not video_files:
+        logging.warning("Dataset has no videos to re-encode")
+        return
+
+    logging.info("Re-encoding %d video file(s) with CUDA and %s", len(video_files), encoder)
+    for video_file in tqdm(video_files, desc="GPU re-encoding videos"):
+        temp_output_path = video_file.with_name(f"{video_file.stem}_temp{video_file.suffix}")
+        cmd = [
+            "ffmpeg",
+            "-hwaccel",
+            "cuda",
+            "-i",
+            str(video_file),
+            "-c:v",
+            encoder,
+            "-pix_fmt",
+            rgb_encoder.pix_fmt,
+            "-c:a",
+            "copy",
+            "-y",
+            str(temp_output_path),
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logging.error("FFmpeg GPU error for %s: %s", video_file, result.stderr)
+                raise RuntimeError(f"Failed to GPU re-encode video {video_file}")
+            os.replace(temp_output_path, video_file)
+        except Exception:
+            if temp_output_path.exists():
+                temp_output_path.unlink()
+            raise
+
+    for video_key in dataset.meta.video_keys:
+        dataset.meta.update_video_info(video_key=video_key, video_encoder=rgb_encoder)
+    write_info(dataset.meta.info, dataset.meta.root)
 
 
 def get_output_path(
@@ -942,16 +1025,25 @@ def handle_reencode_videos(cfg: EditDatasetConfig) -> None:
     if not isinstance(cfg.operation, ReencodeVideosConfig):
         raise ValueError("Operation config must be ReencodeVideosConfig")
 
-    output_repo_id, input_root, output_root = _resolve_io_paths(
-        cfg.repo_id,
-        cfg.new_repo_id,
-        cfg.root,
-        cfg.new_root,
-        default_new_repo_id=f"{cfg.repo_id}_reencoded",
-    )
+    output_choice = None
+    if cfg.new_repo_id is None and cfg.new_root is None:
+        output_choice = _choose_reencode_output()
+
+    if output_choice == 2:
+        input_root = (Path(cfg.root) if cfg.root else HF_LEROBOT_HOME / cfg.repo_id).resolve()
+        output_repo_id = cfg.repo_id
+        output_root = input_root
+    else:
+        output_repo_id, input_root, output_root = _resolve_io_paths(
+            cfg.repo_id,
+            cfg.new_repo_id,
+            cfg.root,
+            cfg.new_root,
+            default_new_repo_id=f"{cfg.repo_id}_h264",
+        )
     in_place = _is_in_place(input_root, output_root)
 
-    if in_place and not cfg.operation.overwrite:
+    if in_place and output_choice != 2 and not cfg.operation.overwrite:
         raise ValueError(
             f"reencode_videos would overwrite the dataset in-place at {input_root}. "
             "Pass --operation.overwrite true to allow in-place modification, "
@@ -960,9 +1052,11 @@ def handle_reencode_videos(cfg: EditDatasetConfig) -> None:
         )
 
     if in_place:
-        logging.warning(
-            f"Overwriting dataset videos in-place at {input_root}. The original videos will be lost."
-        )
+        if output_choice == 2:
+            if not input_root.is_dir():
+                raise FileNotFoundError(f"Dataset directory does not exist: {input_root}")
+            _backup_dataset_if_requested(input_root)
+        logging.warning(f"Overwriting dataset videos in-place at {input_root}")
         dataset = LeRobotDataset(cfg.repo_id, root=input_root)
     else:
         logging.info(f"Copying dataset from {input_root} to {output_root}")
@@ -979,13 +1073,20 @@ def handle_reencode_videos(cfg: EditDatasetConfig) -> None:
         f"Re-encoding videos in {output_repo_id} with RGB encoder {cfg.operation.rgb_encoder} "
         f"and depth encoder {cfg.operation.depth_encoder}"
     )
-    reencode_dataset(
-        dataset,
-        rgb_encoder=cfg.operation.rgb_encoder,
-        depth_encoder=cfg.operation.depth_encoder,
-        encoder_threads=cfg.operation.encoder_threads,
-        num_workers=cfg.operation.num_workers,
-    )
+    if cfg.operation.use_gpu:
+        _reencode_videos_with_gpu(
+            dataset,
+            rgb_encoder=cfg.operation.rgb_encoder,
+            encoder_threads=cfg.operation.encoder_threads,
+        )
+    else:
+        reencode_dataset(
+            dataset,
+            rgb_encoder=cfg.operation.rgb_encoder,
+            depth_encoder=cfg.operation.depth_encoder,
+            encoder_threads=cfg.operation.encoder_threads,
+            num_workers=cfg.operation.num_workers,
+        )
 
     logging.info(f"All videos re-encoded at {dataset.root}")
 
