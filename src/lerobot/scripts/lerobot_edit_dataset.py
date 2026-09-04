@@ -228,10 +228,59 @@ Re-encode videos in-place (overwrites original dataset):
 
 Re-encode both RGB and depth videos in a dataset (depth quantization params are preserved):
     lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht_h264 \
+        --operation.type reencode_videos \
+        --operation.rgb_encoder.vcodec h264 \
+        --operation.depth_encoder.vcodec h264 \
+        --operation.rgb_encoder.crf 23 \
+        --operation.depth_encoder.crf 23 \
+        --operation.num_workers 4
+
+Resize videos in-place to 640x480 and back up the original dataset as a zip archive:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --operation.type resize_videos \
+        --operation.width 640 \
+        --operation.height 480
+
+Resize videos using CUDA decode, scaling, and NVIDIA hardware encoding:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --operation.type resize_videos \
+        --operation.width 640 \
+        --operation.height 480 \
+        --operation.use_gpu true
+
+Resize videos in-place without creating a zip backup:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht \
+        --operation.type resize_videos \
+        --operation.width 640 \
+        --operation.height 480 \
+        --operation.overwrite true
+
+Resize videos to a new dataset:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht_resized \
+        --operation.type resize_videos \
+        --operation.width 640 \
+        --operation.height 480
+
+Re-encode both RGB and depth videos in a dataset (depth quantization params are preserved):
+    lerobot-edit-dataset \
         --repo_id lerobot/pusht_depth \
         --operation.type reencode_videos \
         --operation.rgb_encoder.vcodec h264 \
         --operation.depth_encoder.extra_options '{"x265-params": "lossless=1"}'
+
+Rename a camera feature from wrist to hand:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --operation.type rename_cameras \
+        --operation.renames '{"wrist": "hand"}'
 
 Using JSON config file:
     lerobot-edit-dataset \
@@ -239,14 +288,18 @@ Using JSON config file:
 """
 
 import abc
+import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import draccus
+import pyarrow.parquet as pq
+from tqdm import tqdm
 
 from lerobot.configs import (
     DepthEncoderConfig,
@@ -281,6 +334,21 @@ class OperationConfig(draccus.ChoiceRegistry, abc.ABC):
 @dataclass
 class DeleteEpisodesConfig(OperationConfig):
     episode_indices: list[int] | None = None
+
+
+@OperationConfig.register_subclass("rename_cameras")
+@dataclass
+class RenameCamerasConfig(OperationConfig):
+    renames: dict[str, str] | None = None
+
+
+@OperationConfig.register_subclass("resize_videos")
+@dataclass
+class ResizeVideosConfig(OperationConfig):
+    width: int
+    height: int
+    overwrite: bool = False
+    use_gpu: bool = False
 
 
 @OperationConfig.register_subclass("split")
@@ -618,8 +686,6 @@ def handle_convert_image_to_video(cfg: EditDatasetConfig) -> None:
     # instead of checking isinstance()
     dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
 
-    # Determine output directory and repo_id
-    # Priority: 1) new_root, 2) new_repo_id, 3) operation.output_dir, 4) auto-generated name
     output_dir_config = getattr(cfg.operation, "output_dir", None)
     if output_dir_config:
         logging.warning(
@@ -675,7 +741,6 @@ def handle_recompute_stats(cfg: EditDatasetConfig) -> None:
     if not isinstance(cfg.operation, RecomputeStatsConfig):
         raise ValueError("Operation config must be RecomputeStatsConfig")
 
-    # Determine whether this is an in-place operation
     output_repo_id, input_root, output_root = _resolve_io_paths(
         cfg.repo_id,
         cfg.new_repo_id,
@@ -788,6 +853,284 @@ def handle_reencode_videos(cfg: EditDatasetConfig) -> None:
         dataset.push_to_hub()
 
 
+def _normalize_camera_name(name: str) -> str:
+    prefix = "observation.images."
+    name = name.removeprefix(prefix)
+    if not name or "/" in name:
+        raise ValueError(f"Invalid camera name: {name!r}")
+    return name
+
+
+def _rename_camera_metadata(root: Path, renames: dict[str, str]) -> None:
+    info_path = root / "meta" / "info.json"
+    if not info_path.is_file():
+        raise FileNotFoundError(f"Dataset metadata file does not exist: {info_path}")
+
+    info = json.loads(info_path.read_text())
+    features = info.get("features", {})
+    episodes_files = sorted((root / "meta" / "episodes").rglob("*.parquet"))
+    video_root = root / "videos"
+
+    for old_name, new_name in renames.items():
+        old_name = _normalize_camera_name(old_name)
+        new_name = _normalize_camera_name(new_name)
+        if old_name == new_name:
+            raise ValueError(f"Camera rename has identical source and destination: {old_name!r}")
+
+        old_feature = f"observation.images.{old_name}"
+        new_feature = f"observation.images.{new_name}"
+        old_prefix = f"videos/{old_feature}/"
+        new_prefix = f"videos/{new_feature}/"
+        old_dir = video_root / old_feature
+        new_dir = video_root / new_feature
+
+        info_has_old = old_feature in features
+        info_has_new = new_feature in features
+        old_columns = {
+            path: [column for column in pq.read_schema(path).names if column.startswith(old_prefix)]
+            for path in episodes_files
+        }
+        new_columns = {
+            path: [column for column in pq.read_schema(path).names if column.startswith(new_prefix)]
+            for path in episodes_files
+        }
+        parquet_has_old = any(old_columns.values())
+        parquet_has_new = any(new_columns.values())
+        sources = sum((info_has_old, old_dir.is_dir(), parquet_has_old))
+        if sources != 3:
+            logging.warning(
+                "Camera %r is only present in %d of 3 dataset locations (info.json, videos/, episodes parquet); "
+                "renaming available entries only.",
+                old_name,
+                sources,
+            )
+
+        if info_has_old and info_has_new:
+            raise ValueError(f"Cannot rename camera {old_name!r}: destination already exists in info.json")
+        if old_dir.is_dir() and new_dir.exists():
+            raise ValueError(f"Cannot rename camera {old_name!r}: destination directory already exists: {new_dir}")
+        if parquet_has_old and parquet_has_new:
+            raise ValueError(f"Cannot rename camera {old_name!r}: destination already exists in episodes parquet")
+
+        if info_has_old:
+            features[new_feature] = features.pop(old_feature)
+
+        for path, columns in old_columns.items():
+            if not columns:
+                continue
+            table = pq.read_table(path)
+            renamed_columns = [
+                column.replace(old_prefix, new_prefix, 1) if column.startswith(old_prefix) else column
+                for column in table.column_names
+            ]
+            temp_path = path.with_suffix(".parquet.tmp")
+            pq.write_table(table.rename_columns(renamed_columns), temp_path)
+            os.replace(temp_path, path)
+
+        if old_dir.is_dir():
+            old_dir.rename(new_dir)
+
+    temp_info_path = info_path.with_suffix(".json.tmp")
+    temp_info_path.write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n")
+    os.replace(temp_info_path, info_path)
+
+
+def handle_rename_cameras(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, RenameCamerasConfig):
+        raise ValueError("Operation config must be RenameCamerasConfig")
+    if not cfg.operation.renames:
+        raise ValueError("renames must be specified for rename_cameras operation")
+
+    input_root = (Path(cfg.root) if cfg.root else HF_LEROBOT_HOME / cfg.repo_id).resolve()
+    rename_in_place = cfg.new_repo_id is None and cfg.new_root is None
+    if rename_in_place:
+        output_repo_id = cfg.repo_id
+        output_root = input_root
+        if not input_root.is_dir():
+            raise FileNotFoundError(f"Dataset directory does not exist: {input_root}")
+        backup_archive = input_root.with_name(input_root.name + "_old.zip")
+        if backup_archive.exists():
+            logging.warning(f"Using existing original dataset backup: {backup_archive}")
+        else:
+            logging.info(f"Backing up original dataset to {backup_archive}")
+            shutil.make_archive(str(backup_archive.with_suffix("")), "zip", root_dir=input_root)
+    else:
+        output_repo_id, input_root, output_root = _resolve_io_paths(
+            cfg.repo_id,
+            cfg.new_repo_id,
+            cfg.root,
+            cfg.new_root,
+            default_new_repo_id=f"{cfg.repo_id}_renamed",
+        )
+        if output_root.exists():
+            backup_path = output_root.with_name(output_root.name + "_old")
+            if backup_path.exists():
+                shutil.rmtree(backup_path)
+            shutil.move(output_root, backup_path)
+        shutil.copytree(input_root, output_root)
+
+    _rename_camera_metadata(output_root, cfg.operation.renames)
+    logging.info(f"Camera names renamed in {output_root}")
+
+    if cfg.push_to_hub:
+        dataset = LeRobotDataset(output_repo_id, root=output_root)
+        dataset.push_to_hub()
+
+
+def handle_resize_videos(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, ResizeVideosConfig):
+        raise ValueError("Operation config must be ResizeVideosConfig")
+
+    if cfg.operation.width <= 0 or cfg.operation.height <= 0:
+        raise ValueError("Width and height must be positive integers")
+
+    input_root = (Path(cfg.root) if cfg.root else HF_LEROBOT_HOME / cfg.repo_id).resolve()
+    resize_in_place = cfg.new_repo_id is None and cfg.new_root is None
+    if resize_in_place:
+        output_repo_id = cfg.repo_id
+        output_root = input_root
+    else:
+        output_repo_id, input_root, output_root = _resolve_io_paths(
+            cfg.repo_id,
+            cfg.new_repo_id,
+            cfg.root,
+            cfg.new_root,
+            default_new_repo_id=f"{cfg.repo_id}_resized",
+        )
+
+    in_place = _is_in_place(input_root, output_root)
+
+    if in_place and not resize_in_place and not cfg.operation.overwrite:
+        raise ValueError(
+            f"resize_videos would overwrite the dataset in-place at {input_root}. "
+            "Pass --operation.overwrite true to allow in-place modification, "
+            "or use --new_repo_id / --new_root to write to a different location. "
+            f"Default output repo_id when neither is set: '{cfg.repo_id}_resized'."
+        )
+
+    if resize_in_place:
+        if not input_root.is_dir():
+            raise FileNotFoundError(f"Dataset directory does not exist: {input_root}")
+
+        backup_archive = input_root.with_name(input_root.name + "_old.zip")
+        if backup_archive.exists():
+            logging.warning(f"Using existing original dataset backup: {backup_archive}")
+        else:
+            logging.info(f"Backing up original dataset to {backup_archive}")
+            shutil.make_archive(
+                str(backup_archive.with_suffix("")),
+                "zip",
+                root_dir=input_root,
+            )
+        logging.warning(f"Resizing videos in-place at {input_root}")
+    elif in_place:
+        logging.warning(
+            f"Overwriting dataset videos in-place at {input_root}. The original videos will be lost."
+        )
+    else:
+        logging.info(f"Copying dataset from {input_root} to {output_root}")
+        if output_root.exists():
+            backup_path = output_root.with_name(output_root.name + "_old")
+            logging.warning(f"Output directory {output_root} already exists. Moving to {backup_path}")
+            if backup_path.exists():
+                shutil.rmtree(backup_path)
+            shutil.move(output_root, backup_path)
+        shutil.copytree(input_root, output_root)
+
+    if cfg.operation.use_gpu:
+        logging.info(
+            f"Resizing videos in {output_repo_id} to {cfg.operation.width}x{cfg.operation.height} "
+            "using CUDA and NVIDIA NVENC"
+        )
+    else:
+        logging.info(
+            f"Resizing videos in {output_repo_id} to {cfg.operation.width}x{cfg.operation.height} "
+            "using CPU"
+        )
+
+    video_files = list(output_root.glob("videos/**/*.mp4"))
+    if not video_files:
+        logging.warning("No video files found to resize")
+        return
+
+    for video_file in tqdm(video_files, desc="Resizing videos"):
+        temp_output_path = video_file.with_name(f"{video_file.stem}_temp{video_file.suffix}")
+        try:
+            if cfg.operation.use_gpu:
+                cmd = [
+                    "ffmpeg",
+                    "-hwaccel",
+                    "cuda",
+                    "-hwaccel_output_format",
+                    "cuda",
+                    "-i",
+                    str(video_file),
+                    "-vf",
+                    f"scale_cuda={cfg.operation.width}:{cfg.operation.height}",
+                    "-c:v",
+                    "h264_nvenc",
+                    "-c:a",
+                    "copy",
+                    "-y",
+                    str(temp_output_path),
+                ]
+            else:
+                cmd = [
+                    "ffmpeg",
+                    "-i",
+                    str(video_file),
+                    "-vf",
+                    f"scale={cfg.operation.width}:{cfg.operation.height}",
+                    "-c:a",
+                    "copy",
+                    "-y",
+                    str(temp_output_path),
+                ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                mode = "GPU" if cfg.operation.use_gpu else "CPU"
+                logging.error(f"FFmpeg {mode} error for {video_file}: {result.stderr}")
+                raise RuntimeError(f"Failed to resize video {video_file} using {mode}")
+            os.replace(temp_output_path, video_file)
+        except Exception as e:
+            if temp_output_path.exists():
+                try:
+                    temp_output_path.unlink()
+                except Exception:
+                    pass
+            logging.error(f"Error processing video {video_file}: {e}")
+            raise
+
+    info_path = output_root / "meta" / "info.json"
+    if not info_path.is_file():
+        raise FileNotFoundError(f"Dataset metadata file does not exist: {info_path}")
+
+    info = json.loads(info_path.read_text())
+    for feature in info.get("features", {}).values():
+        if feature.get("dtype") != "video":
+            continue
+        shape = feature.get("shape")
+        channels = shape[2] if isinstance(shape, list) and len(shape) == 3 else 3
+        feature["shape"] = [cfg.operation.height, cfg.operation.width, channels]
+        feature_info = feature.setdefault("info", {})
+        feature_info["video.height"] = cfg.operation.height
+        feature_info["video.width"] = cfg.operation.width
+
+    temp_info_path = info_path.with_suffix(".json.tmp")
+    temp_info_path.write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n")
+    os.replace(temp_info_path, info_path)
+
+    logging.info(
+        f"All videos and video metadata resized to {cfg.operation.width}x{cfg.operation.height} "
+        f"at {output_root}"
+    )
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}...")
+        dataset = LeRobotDataset(output_repo_id, root=output_root)
+        dataset.push_to_hub()
+
+
 def _get_dataset_size(repo_path):
     import os
 
@@ -863,6 +1206,10 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_recompute_stats(cfg)
     elif operation_type == "reencode_videos":
         handle_reencode_videos(cfg)
+    elif operation_type == "rename_cameras":
+        handle_rename_cameras(cfg)
+    elif operation_type == "resize_videos":
+        handle_resize_videos(cfg)
     elif operation_type == "info":
         handle_info(cfg)
     else:
