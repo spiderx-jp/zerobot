@@ -733,24 +733,30 @@ def concatenate_video_files(
             # set the time base to the input stream time base (missing in the codec context)
             stream_map[input_stream.index].time_base = input_stream.time_base
 
-    # Demux + remux packets (no re-encode)
-    for packet in input_container.demux():
-        # Skip packets from un-mapped streams
-        if packet.stream.index not in stream_map:
-            continue
+    try:
+        # Demux + remux packets (no re-encode). Some files have a duplicated DTS
+        # at a concat boundary, so keep timestamps strictly increasing per stream.
+        last_dts: dict[int, int] = {}
+        for packet in input_container.demux():
+            source_stream_index = packet.stream.index
+            if source_stream_index not in stream_map or packet.dts is None:
+                continue
 
-        # Skip demux flushing packets
-        if packet.dts is None:
-            continue
+            output_stream = stream_map[source_stream_index]
+            previous_dts = last_dts.get(source_stream_index)
+            if previous_dts is not None and packet.dts <= previous_dts:
+                packet.dts = previous_dts + 1
+                if packet.pts is not None and packet.pts < packet.dts:
+                    packet.pts = packet.dts
+            packet.stream = output_stream
+            output_container.mux(packet)
+            last_dts[source_stream_index] = packet.dts
+    finally:
+        input_container.close()
+        output_container.close()
+        Path(tmp_concatenate_path).unlink(missing_ok=True)
 
-        output_stream = stream_map[packet.stream.index]
-        packet.stream = output_stream
-        output_container.mux(packet)
-
-    input_container.close()
-    output_container.close()
     shutil.move(tmp_output_video_path, output_video_path)
-    Path(tmp_concatenate_path).unlink()
 
 
 class _CameraEncoderThread(threading.Thread):
